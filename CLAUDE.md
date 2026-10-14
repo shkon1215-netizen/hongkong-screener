@@ -238,10 +238,23 @@ page's verdict equals the Python funnel at default thresholds.
 `.github/workflows/screen.yml` runs at 09:30 UTC on weekdays (HKEX closes
 16:10 HKT = 08:10 UTC; Hong Kong keeps no daylight saving), builds `site/`
 and deploys to GitHub Pages, with a retry after a pause for Yahoo
-throttling. Not yet pushed: there is no repo or live URL. Whether HKEX's
-two endpoints answer GitHub's runners is untested — if the roster step
-fails in CI while working locally, suspect HKEX blocking the runner range
-before a code change.
+throttling.
+
+Live: https://shkon1215-netizen.github.io/hongkong-screener/. Unlisted -
+`noindex` plus a blanket `robots.txt` - but the repo is public, which free
+Pages requires. No screen output is committed.
+
+**HKEX and Yahoo both answer GitHub's runners** - confirmed on the first
+working run, 2026-10-14: the List of Securities and the equities feed
+(2,796 caps) both read, 1,284 of 1,299 lines priced, no retry needed, ~11
+minutes cold. The funnel matched the local run to within the day's price
+moves (701 / 568 / 158 against 699 / 566 / 157). The run before it failed
+on a missing `openpyxl` - requirements.txt had come from France, which
+reads a CSV. If the roster step ever fails in CI while working locally,
+suspect HKEX blocking the runner range before a code change.
+
+A docs-only push does not trigger a run (`paths-ignore: **.md`); start one
+with `gh workflow run screen.yml`.
 
 ## Interpretation
 

@@ -1,5 +1,8 @@
 # Hong Kong (HKEX) Relative Valuation Screener
 
+**Live:** https://shkon1215-netizen.github.io/hongkong-screener/ · rebuilt each
+weekday after the HKEX close
+
 Finds Hong Kong-listed stocks trading at a discount to their industry peers
 on P/E, P/B and EV/EBITDA — and, independently, stocks that are cheap in
 absolute terms, and stocks that are cheap against their own filed history.
