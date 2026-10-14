@@ -1,0 +1,17 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Fetch cache - per-day, per-machine, rebuilt on demand
+.hk_cache/
+
+# Generated results and dashboards. Regenerated on every run, so committing
+# them only creates merge noise and stale data.
+hk_screen_results.csv
+hk_screen_results_meta.json
+hk_dashboard.html
+site/
+
+# Local preview config
+.claude/

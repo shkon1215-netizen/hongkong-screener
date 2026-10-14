@@ -1,0 +1,80 @@
+name: Run screen and publish
+
+# HKEX's closing auction ends about 16:10 Hong Kong time, 08:10 UTC. Hong Kong
+# keeps no daylight saving, so one cron fits the whole year; 09:30 UTC leaves
+# Yahoo an hour to settle the day's closes.
+on:
+  schedule:
+    - cron: "30 9 * * 1-5"
+  workflow_dispatch:        # lets you trigger a run by hand from the Actions tab
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A scheduled run and a manual one must not publish over each other.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Pinned rather than ubuntu-latest, so a runner-image change arrives as a
+    # commit that can be tested, not as a silent switch mid-schedule.
+    runs-on: ubuntu-26.04
+    # ~1,200 .info calls cold - three times Germany's - so more headroom.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Offline logic check
+        run: python test_hongkong.py
+
+      # Yahoo rate-limits by IP and shared runner addresses are already busy.
+      # main_hk.py refuses to screen a partial universe rather than publishing
+      # a thin one, so a retry after a pause is the right recovery: the per-day
+      # cache in .hk_cache keeps whatever arrived on the first attempt, and the
+      # second run only asks for the gaps.
+      - name: Screen
+        id: screen
+        continue-on-error: true
+        run: python main_hk.py --all --dashboard ""
+
+      - name: Screen (retry after rate-limit pause)
+        if: steps.screen.outcome == 'failure'
+        run: |
+          echo "First attempt failed - most likely Yahoo throttling. Pausing."
+          sleep 180
+          python main_hk.py --all --dashboard ""
+
+      - name: Build site
+        run: python build_site.py
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-26.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
