@@ -471,6 +471,116 @@ def repair_foreign_reporters(df: pd.DataFrame, hkd_per: dict, hkd_per_ttm: dict 
     return df, stats
 
 
+# ---------------------------------------------------------------------------
+# Cash flow: P/FCF and the shareholder yield
+# ---------------------------------------------------------------------------
+def add_cashflow_metrics(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """P/FCF (a fourth peer metric) and the shareholder yield, from the latest
+    filed cash-flow statement (providers_hk.cashflow_fields).
+
+    Both are struck on today's market value in the REPORTING currency over
+    the filed year - the basis the own-history screen already uses - so a
+    foreign reporter needs no extra repair. P/FCF is missing for financials,
+    as EV/EBITDA is (invariant 6): a bank's operating cash flow moves with
+    its deposits and loans, not its earnings. The shareholder yield is
+    dividends plus buybacks less shares issued, so a company that buys back
+    stock only to offset employee grants does not get credit for it.
+    """
+    df = df.copy()
+    n = lambda c: pd.to_numeric(df.get(c), errors="coerce")  # noqa: E731
+    fx = n("fx_now")
+    same = df.get("fin_ccy", pd.Series("", index=df.index)).fillna("").astype(str) \
+             .eq(df.get("currency", pd.Series("", index=df.index)).fillna("").astype(str))
+    fx = fx.where(fx.notna(), np.where(same, 1.0, np.nan))
+    mv = n("market_cap_local") * fx
+    fcf = n("lf_fcf")
+    pfcf = (mv / fcf).where((fcf > 0) & (mv > 0))
+    lo, hi = K.METRIC_BOUNDS["price_to_fcf"]
+    df["price_to_fcf"] = pfcf.where((pfcf >= lo) & (pfcf <= hi)).where(~_fin_mask(df))
+    paid = n("lf_div_paid") + n("lf_buyback") - n("lf_issuance")
+    df["sh_yield"] = (paid / mv * 100.0).where(mv > 0)
+    df["fcf_negative"] = fcf <= 0
+    stats = {"cashflow_known": int(fcf.notna().sum()),
+             "pfcf_valid": int(df["price_to_fcf"].notna().sum()),
+             "sh_yield_known": int(df["sh_yield"].notna().sum())}
+    return df, stats
+
+
+# ---------------------------------------------------------------------------
+# One-off earnings
+# ---------------------------------------------------------------------------
+def _hist_oneoff_ratio(df: pd.DataFrame, tax: float) -> pd.Series:
+    """Median of net profit over after-tax operating profit in the filed
+    years BEFORE the latest one (np_y1/op_y1, np_y2/op_y2). High means the
+    gap is the company's structure (a trading house's equity-method income),
+    not a one-off."""
+    rs = []
+    for i in (1, 2):
+        np_ = pd.to_numeric(df.get(f"np_y{i}"), errors="coerce")
+        op = pd.to_numeric(df.get(f"op_y{i}"), errors="coerce")
+        rs.append((np_ / (op * (1 - tax))).where(op > 0))
+    return pd.concat(rs, axis=1).median(axis=1, skipna=True)
+
+
+def apply_oneoff_guard(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[pd.DataFrame, dict]:
+    """Earnings that came from below the operating line, capped.
+
+    Yahoo's trailing P/E and the ROE built from it take net income as
+    reported, one-offs included: Lyft's P/E of 2.5 and ROE of 85% are a tax
+    valuation-allowance release (net income USD 2.87bn on an operating loss
+    over four quarters), Boyd's a gain on selling its FanDuel stake, FIS's
+    the Worldpay sale. Germany's K+S and Hong Kong's 3SBio were the same
+    shape. The test: net income above ONEOFF_RATIO times operating profit
+    after a statutory tax rate, both summed over the last four QUARTERS from
+    one statement (providers.ttm_fields) - or the latest filed year where
+    four quarters are not available (half-yearly reporters). Ordinary
+    companies sit at 1.0-1.2 (Microsoft 1.15, Qualcomm 1.20, Deckers 1.08).
+    Not .info's operatingMargins: that is one quarter's margin, and it made
+    141 flags out of 2,285 on the first run, most of them false.
+
+    It fires only where the gap is NEW: if the earlier filed years show the
+    same ratio, the earnings are the company's structure - Mitsubishi
+    Corporation's equity-method income reads 2.1 every year - and are left
+    alone. Financials are exempt; a bank's "operating income" is not the
+    line this test needs.
+
+    A flagged row is scored on capped earnings - operating profit after tax
+    - so its P/E and EPS (and with it the ROE) are restated before the peer
+    medians are built. An operating loss under a reported profit leaves no
+    P/E at all. The row is tagged; nothing is dropped.
+    """
+    df = df.copy()
+    tax = cfg.oneoff_tax_pct / 100.0
+    n = lambda c: pd.to_numeric(df.get(c), errors="coerce")  # noqa: E731
+    quarters = n("ttm_op").notna() & n("ttm_ni").notna()
+    ni = n("ttm_ni").where(quarters, n("lf_np_rep"))
+    op = n("ttm_op").where(quarters, n("lf_op"))
+    df["oneoff_basis"] = np.where(quarters, "4 quarters",
+                                  np.where(op.notna() & ni.notna(), "filed year", ""))
+    cap = op * (1 - tax)
+    ratio = (ni / cap).where(cap > 0)
+    ratio = ratio.where(~((op <= 0) & (ni > 0)), np.inf)
+    hist = _hist_oneoff_ratio(df, tax)
+    structural = hist > cfg.oneoff_ratio
+    flag = (~_fin_mask(df) & (ni > 0) & (ratio > cfg.oneoff_ratio) & ~structural
+            & cfg.oneoff_guard)
+    k = (cap.clip(lower=0) / ni).where(flag)
+    eps, pe = n("trailing_eps"), n("trailing_pe")
+    df["trailing_eps"] = eps.where(~flag, eps * k)
+    df["trailing_pe"] = pe.where(~flag, (pe / k).where(k > 0))
+    df["oneoff_ratio"] = ratio.replace(np.inf, np.nan)
+    df["oneoff_capped"] = flag
+    df["oneoff_structural"] = structural & (ratio > cfg.oneoff_ratio) & ~_fin_mask(df)
+    stats = {"oneoff_capped": int(flag.sum()),
+             "oneoff_on_quarters": int(quarters.sum()),
+             "oneoff_no_operating_profit": int((flag & ~(cap > 0)).sum()),
+             "oneoff_structural_spared": int(df["oneoff_structural"].sum())}
+    if flag.any():
+        log.info("one-off guard: %d trailing P/Es restated on operating profit (%s)",
+                 int(flag.sum()), ", ".join(df.loc[flag, "ticker"].astype(str).head(25)))
+    return df, stats
+
+
 def add_valueup_flags(df: pd.DataFrame) -> pd.DataFrame:
     """Low-P/B flags.
 
@@ -570,7 +680,13 @@ def apply_absolute_screen(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[pd.Dat
     pbr = pd.to_numeric(df.get("price_to_book"), errors="coerce")
     ev = pd.to_numeric(df.get("ev_to_ebitda"), errors="coerce")
     roe = pd.to_numeric(df.get("roe_pct"), errors="coerce")
-    dy = pd.to_numeric(df.get("div_yield"), errors="coerce")
+    # The payout test is the SHAREHOLDER yield - dividends plus net buybacks
+    # over market value (add_cashflow_metrics) - with the dividend yield where
+    # no cash-flow statement was filed. The user's 2% floor stays.
+    shy = pd.to_numeric(df.get("sh_yield", pd.Series(np.nan, index=df.index)),
+                        errors="coerce")
+    dy = shy.where(shy.notna(), pd.to_numeric(df.get("div_yield"), errors="coerce"))
+    df["payout_yield"] = dy
     fin = _fin_mask(df)
 
     df["abs_pbr_ok"] = pbr.notna() & (pbr < cfg.abs_max_pbr)
@@ -608,7 +724,8 @@ def apply_absolute_screen(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[pd.Dat
         f"abs_pbr_under_{cfg.abs_max_pbr:g}": int(df["abs_pbr_ok"].sum()),
         f"abs_ev_under_{cfg.abs_max_ev_ebitda:g}": int(df["abs_ev_ok"].sum()),
         "abs_pbr_below_fair": int(df["abs_pbr_vs_roe_ok"].sum()),
-        f"abs_div_over_{cfg.abs_min_div_yield:g}pct": int(df["abs_div_ok"].sum()),
+        f"abs_payout_over_{cfg.abs_min_div_yield:g}pct": int(df["abs_div_ok"].sum()),
+        "abs_payout_from_dividends_only": int((df["abs_div_ok"] & shy.isna()).sum()),
         "abs_passing": int(absp.sum()),
         "abs_via_financial_carveout": int((absp & df["abs_via_carveout"]).sum()),
         "abs_new_vs_relative": int((absp & ~rel).sum()),
@@ -825,6 +942,9 @@ def hk_output_columns(cfg: K.ScreenConfig) -> list[str]:
     cols += ["screen", "passes_any", "abs_passes", "abs_pbr_ok", "abs_ev_ok",
              "abs_pbr_vs_roe_ok", "abs_div_ok", "abs_roe_ok", "abs_fair_pbr",
              "abs_via_carveout", "ttm_vs_filed_loss",
+             "oneoff_capped", "oneoff_ratio", "oneoff_structural",
+             "price_to_fcf", "sh_yield", "payout_yield",
+             "lf_fcf", "lf_div_paid", "lf_buyback", "lf_issuance",
              "roe_pct", "roe_ok", "roe_tier", "div_yield", "pays_dividend",
              "pbr_below_1", "pbr_bottom20_industry",
              "n_valid_metrics", "n_metrics_passing", "metrics_passing",

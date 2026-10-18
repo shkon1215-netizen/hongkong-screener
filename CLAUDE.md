@@ -191,6 +191,37 @@ Browser verdict at default thresholds equals Python's: 157 / 104 / 75 / 44,
 and every per-test count (P/B < 1 183, EV < 8 185, fair 145, yield 291,
 ROE 332, carve-out 32).
 
+
+## Cash flow, shareholder yield and the one-off guard (added 2026-10-18)
+
+Added to all eight screeners at once, from the US build. Source: yfinance's annual cash-flow statement, fetched with the income statement (`cashflow_fields`; `STATEMENTS_CACHE_VERSION` 5).
+
+- **P/FCF is a fourth peer metric** - market value over the latest filed
+  free cash flow (operating cash flow less capex), in the reporting
+  currency. Missing for financials, as EV/EBITDA is (invariant 6), and for a
+  negative free cash flow. The relative rule is unchanged: 20% below peers
+  on at least two of the metrics a company has, so with four metrics a name
+  has more ways to qualify.
+- **The outright screen's payout test is the shareholder yield** -
+  dividends plus buybacks less shares issued, over market value. The 2%
+  floor is the user's, unchanged. A company buying back only what it issues
+  to employees gets no credit; where no cash-flow statement was filed the
+  dividend yield stands in (`abs_payout_from_dividends_only` counts them).
+  Measured in the US: the dividend floor alone cut 89 cheap, profitable
+  names to 46.
+- **One-off guard.** On the last four quarters' net and operating profit, summed from Yahoo's quarterly income statement (the latest filed year where four quarters are not available, as for half-yearly reporters). NOT .info's operatingMargins, which is one quarter's margin: on the first US run it gave 141 flags out of 2,285, most of them false (AECOM, Intuit, Qualcomm): net profit above 1.5x operating profit
+  after a 16.5% tax rate, where the earlier filed years do NOT show the same
+  gap, is treated as below-the-line (a tax credit, an investment gain, an
+  asset sale). The row's P/E and EPS - and so its ROE - are restated on
+  operating profit after tax BEFORE the peer medians are built; an operating
+  loss under a reported profit leaves no P/E. Tagged `one-off`, never
+  dropped. A gap present every year (an equity-method holding, a trading
+  house) is structural and spared; financials are exempt. Measured cases:
+  Lyft 21.9x (tax allowance release), Rigel 5.2x, Alphabet 2.2x (gains on
+  stakes); ordinary companies 1.0-1.2x (Microsoft 1.19, Apple 1.13);
+  Mitsubishi Corporation 2.1x every year (spared). `--no-oneoff-guard`
+  scores earnings as reported.
+
 ## Known gaps (ranked by value of fixing)
 
 1. **No HSICS.** Peers are Yahoo's industry (299 of 565 scored within it on

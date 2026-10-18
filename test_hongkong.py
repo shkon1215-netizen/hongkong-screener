@@ -521,8 +521,89 @@ def check_history_screen():
     ok(pd.notna(idx.loc["PROP", "evx_now"]), "real estate keeps EV/EBITDA (not a financial)")
 
 
+
+def check_cashflow_oneoff() -> list[str]:
+    """P/FCF, the shareholder yield and the one-off guard - the US build's
+    cases, which are Yahoo's rules and hold for every market."""
+    from providers_hk import cashflow_fields
+    fails: list[str] = []
+
+    def chk(cond, label):
+        print(f"  {'OK  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            fails.append(label)
+
+    print("\n=== cash flow, shareholder yield, one-off guard ===")
+    lf = pd.Timestamp("2025-12-31")
+    cf = pd.DataFrame({lf: {"Operating Cash Flow": 150e6, "Capital Expenditure": -50e6,
+                            "Free Cash Flow": 100e6, "Cash Dividends Paid": -20e6,
+                            "Repurchase Of Capital Stock": -30e6,
+                            "Issuance Of Capital Stock": 10e6}})
+    f = cashflow_fields(cf, lf)
+    chk(f == {"lf_fcf": 100e6, "lf_div_paid": 20e6, "lf_buyback": 30e6, "lf_issuance": 10e6},
+        "cash-flow rows read as positive amounts")
+    chk(all(np.isnan(v) for v in cashflow_fields(cf, pd.Timestamp("2024-12-31")).values()),
+        "no column for the filed year -> missing, never zero")
+
+    base = dict(market_cap_local=2e9, fx_now=1.0, currency="X", fin_ccy="X")
+    df = pd.DataFrame([
+        dict(ticker="CASH", sector="Industrials", lf_fcf=100e6, lf_div_paid=20e6,
+             lf_buyback=30e6, lf_issuance=10e6, **base),
+        dict(ticker="SBC", sector="Technology", lf_fcf=50e6, lf_div_paid=0.0,
+             lf_buyback=40e6, lf_issuance=40e6, **base),
+        dict(ticker="BANK", sector="Financial Services", lf_fcf=900e6, lf_div_paid=60e6,
+             lf_buyback=0.0, lf_issuance=0.0, **base),
+        dict(ticker="BURN", sector="Technology", lf_fcf=-80e6, lf_div_paid=0.0,
+             lf_buyback=0.0, lf_issuance=0.0, **base),
+    ])
+    out, _ = HF.add_cashflow_metrics(df)
+    i = out.set_index("ticker")
+    chk(i.loc["CASH", "price_to_fcf"] == 20.0 and abs(i.loc["CASH", "sh_yield"] - 2.0) < 1e-9,
+        "P/FCF 20, shareholder yield 2% (dividends + buybacks - issuance)")
+    chk(i.loc["SBC", "sh_yield"] == 0.0, "buybacks that only offset share grants earn no yield")
+    chk(np.isnan(i.loc["BANK", "price_to_fcf"]) and np.isnan(i.loc["BURN", "price_to_fcf"]),
+        "no P/FCF for a bank (invariant 6) or a negative free cash flow")
+
+    cfg = ScreenConfig()
+    rows = pd.DataFrame([
+        dict(ticker=t, sector="Industrials", price_to_book=0.8, ev_to_ebitda=5.0, roe_pct=15.0,
+             div_yield=dv, sh_yield=sh, passes=False, avg_discount=0.0)
+        for t, dv, sh in (("BUYB", 0.5, 4.0), ("NOCF", 3.0, np.nan), ("DILU", 3.0, -1.0))])
+    r, _ = HF.apply_absolute_screen(rows, cfg)
+    a = r.set_index("ticker")["abs_passes"]
+    chk(bool(a["BUYB"]) and bool(a["NOCF"]) and not bool(a["DILU"]),
+        "payout test: buybacks count, no statement falls back to dividends, dilution fails")
+
+    tax = cfg.oneoff_tax_pct / 100.0
+
+    def row(t, ni, rev, opm, pe=10.0, eps=5.0, sector="Technology",
+            hist=((100, 100), (100, 100))):
+        r = dict(ticker=t, sector=sector, ttm_ni=ni, ttm_op=rev * opm,
+                 trailing_pe=pe, trailing_eps=eps)
+        for k, (n_, o) in enumerate(hist, 1):
+            r[f"np_y{k}"], r[f"op_y{k}"] = n_, o
+        return r
+    g = pd.DataFrame([
+        row("ONEOFF", 2.87e9, 6.77e9, 0.0258, pe=2.5, eps=7.0, hist=((-340, -100), (22, -70))),
+        row("PLAIN", 100e6, 1000e6, 0.13 / (1 - tax) * 1.0, pe=15.0),
+        row("TRADER", 896e9, 19878e9, 0.029, sector="Industrials",
+            hist=((950 * (1 - tax) / 0.75, 630), (960 * (1 - tax) / 0.75, 640))),
+        row("BANK", 64.5e9, 190.7e9, 0.10, sector="Financial Services"),
+    ])
+    o, _ = HF.apply_oneoff_guard(g, cfg)
+    j = o.set_index("ticker")
+    k = 6.77e9 * 0.0258 * (1 - tax) / 2.87e9
+    chk(bool(j.loc["ONEOFF", "oneoff_capped"]) and abs(j.loc["ONEOFF", "trailing_pe"] - 2.5 / k) < 1e-6,
+        "one-off: P/E restated on operating profit after tax")
+    chk(not bool(j.loc["PLAIN", "oneoff_capped"]) and j.loc["PLAIN", "trailing_pe"] == 15.0,
+        "an ordinary company is untouched")
+    chk(not bool(j.loc["TRADER", "oneoff_capped"]), "a gap present in every filed year is structural, spared")
+    chk(not bool(j.loc["BANK", "oneoff_capped"]), "financials exempt")
+    return fails
+
 def main() -> int:
     check_parsers()
+    FAILURES.extend(check_cashflow_oneoff())
     check_roster()
     check_screens()
     check_currency()

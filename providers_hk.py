@@ -580,6 +580,19 @@ IS_ROWS = {
     "np_norm": ("Normalized Income",),
     "ebitda_norm": ("Normalized EBITDA",),
 }
+# Cash-flow rows, latest filed year only: free cash flow for P/FCF, and what
+# the company paid its shareholders for the shareholder yield. Yahoo signs
+# outflows negative (dividends, repurchases, capex); they are stored as
+# positive amounts. "Free Cash Flow" is Yahoo's operating cash flow less
+# capital expenditure; where it is absent the two parts are used.
+CF_ROWS = {
+    "fcf": ("Free Cash Flow",),
+    "ocf": ("Operating Cash Flow", "Cash Flow From Continuing Operating Activities"),
+    "capex": ("Capital Expenditure",),
+    "div_paid": ("Cash Dividends Paid", "Common Stock Dividend Paid"),
+    "buyback": ("Repurchase Of Capital Stock", "Common Stock Payments"),
+    "issuance": ("Issuance Of Capital Stock", "Common Stock Issuance"),
+}
 BS_ROWS = {
     "equity": ("Common Stock Equity", "Stockholders Equity"),
     "shares": ("Ordinary Shares Number", "Share Issued"),
@@ -641,7 +654,7 @@ MAX_FILING_AGE_DAYS = 548
 # build_statement_record does not reach names already cached - bump this and
 # the next run refetches instead of serving numbers the new code would not
 # produce.
-STATEMENTS_CACHE_VERSION = 4
+STATEMENTS_CACHE_VERSION = 6        # 5: cash-flow fields; 6: four-quarter TTM
 
 
 def cagr(values: list) -> float:
@@ -702,7 +715,9 @@ def build_statement_record(inc: pd.DataFrame, bs: pd.DataFrame,
                            close_now: float, mcap_now: float,
                            fin_years: int = 3, max_hist: int = 5,
                            asof: str | pd.Timestamp | None = None,
-                           splits: pd.Series | None = None) -> dict:
+                           splits: pd.Series | None = None,
+                           cf: pd.DataFrame | None = None,
+                           qinc: pd.DataFrame | None = None) -> dict:
     """Everything the two statement-based features need, from raw frames.
 
     Pure: no network, so test_hongkong.py can exercise every trap offline. `px` is
@@ -870,8 +885,81 @@ def build_statement_record(inc: pd.DataFrame, bs: pd.DataFrame,
         # does not have to look it up again.
         "fx_now": fx_last,
     })
+    rec.update(cashflow_fields(cf, lf))
+    # The latest filed year's reported operating and net profit - the one-off
+    # guard's fallback where four quarters are not available.
+    rec["lf_op"] = _num(rows["op"].get(lf))
+    rec["lf_np_rep"] = _num(rows["np"].get(lf))
+    rec.update(ttm_fields(qinc, asof))
     rec.setdefault("hist_note", "")
     return rec
+
+
+# Trailing operating and net profit from the last four QUARTERS, both from the
+# same statement. Not .info's operatingMargins: that is the latest quarter's
+# margin, and times trailing revenue it put AECOM's and Primoris's operating
+# profit below zero and Intuit's at 0.61 of the year (its seasonal quarter) -
+# 141 one-off flags on the first run, most of them false.
+TTM_ROWS = {"op": ("Operating Income", "Total Operating Income As Reported"),
+            "ni": ("Net Income Common Stockholders", "Net Income")}
+# Four quarters spanning no more than this many days from first to last
+# period-end (a missing quarter would stretch it), the latest no older than
+# MAX_TTM_AGE_DAYS. Half-yearly reporters (much of London, Paris, Hong Kong)
+# rarely have four, and fall back to the filed year.
+TTM_MAX_SPAN_DAYS = 300
+MAX_TTM_AGE_DAYS = 200
+
+
+def ttm_fields(qinc: pd.DataFrame | None, asof=None) -> dict:
+    """Sum of the last four quarters' operating and net profit. Pure."""
+    out = {"ttm_op": np.nan, "ttm_ni": np.nan}
+    if qinc is None or qinc.empty:
+        return out
+    op, ni = _row(qinc, TTM_ROWS["op"]), _row(qinc, TTM_ROWS["ni"])
+    both = pd.concat([op, ni], axis=1, keys=["op", "ni"]).dropna()
+    if len(both) < 4:
+        return out
+    last4 = both.sort_index().tail(4)
+    if (last4.index[-1] - last4.index[0]).days > TTM_MAX_SPAN_DAYS:
+        return out
+    if asof is not None and (pd.Timestamp(asof).normalize() - last4.index[-1]).days > MAX_TTM_AGE_DAYS:
+        return out
+    out.update({"ttm_op": float(last4["op"].sum()), "ttm_ni": float(last4["ni"].sum())})
+    return out
+
+
+
+def cashflow_fields(cf: pd.DataFrame | None, lf: pd.Timestamp) -> dict:
+    """Free cash flow and shareholder payouts for the latest filed year, in
+    the REPORTING currency, as positive amounts. Pure.
+
+    Read at the same fiscal year-end as the income statement (`lf`), so
+    P/FCF and the shareholder yield are struck on the year the history's
+    "today" uses. A year with no cash-flow column is missing, never zero -
+    but within a filed column, a payout row Yahoo leaves out (a company that
+    paid no dividend has no dividend row) is zero, because the statement
+    itself says nothing was paid.
+    """
+    out = {"lf_fcf": np.nan, "lf_div_paid": np.nan, "lf_buyback": np.nan,
+           "lf_issuance": np.nan}
+    if cf is None or cf.empty:
+        return out
+    rows = {k: _row(cf, v) for k, v in CF_ROWS.items()}
+    ocf = _num(rows["ocf"].get(lf))
+    if not np.isfinite(ocf):
+        return out                       # no cash-flow statement for that year
+    fcf = _num(rows["fcf"].get(lf))
+    if not np.isfinite(fcf):
+        capex = _num(rows["capex"].get(lf))
+        fcf = ocf + (capex if np.isfinite(capex) else np.nan)
+
+    def paid(key):
+        v = _num(rows[key].get(lf))
+        return abs(v) if np.isfinite(v) else 0.0
+    out.update({"lf_fcf": fcf, "lf_div_paid": paid("div_paid"),
+                "lf_buyback": paid("buyback"), "lf_issuance": paid("issuance")})
+    return out
+
 
 
 def _json_safe(rec: dict) -> dict:
@@ -943,6 +1031,8 @@ def fetch_statements(snap: pd.DataFrame, cfg: ScreenConfig,
         try:
             tk = yf.Ticker(t)
             inc, bs = tk.income_stmt, tk.balance_sheet
+            cf = tk.cashflow
+            qinc = tk.quarterly_income_stmt
             h = tk.history(period="7y", interval="1d", auto_adjust=False)
         except Exception as e:
             log.debug("%s statements: %s", t, e)
@@ -959,7 +1049,8 @@ def fetch_statements(snap: pd.DataFrame, cfg: ScreenConfig,
             inc, bs, px, fxs.get((q_major, f)), r.get("currency"), f,
             _num(r.get("close_local")), _num(r.get("market_cap_local")),
             asof=asof or None,
-            splits=(h["Stock Splits"] if h is not None and "Stock Splits" in h else None))
+            splits=(h["Stock Splits"] if h is not None and "Stock Splits" in h else None),
+            cf=cf, qinc=qinc)
         return t, _json_safe(rec)
 
     if todo:

@@ -9,11 +9,17 @@ absolute terms, and stocks that are cheap against their own filed history.
 Each row also carries three years of revenue, EBITDA and net profit.
 
 **Defaults:** market cap ≥ USD 600M · median daily traded value ≥ USD 1M on
-HKEX · ≥20% below peer median on ≥2 of 3 metrics · ROE ≥ 5%.
+HKEX · ≥20% below peer median on ≥2 of 4 metrics (P/E, P/B, EV/EBITDA, P/FCF) · ROE ≥ 5%.
 
 The seventh market after [Korea](https://github.com/shkon1215-netizen/korea-screener),
 the UK, Japan, Germany, Poland and France. `screener.py` is the same maths;
 what is local is the data layer, the universe hygiene and the currency repair.
+
+
+**Also:** the outright screen's 2% payout floor counts buybacks (shareholder
+yield = dividends + buybacks − issuance), and trailing profit far above
+operating profit — a tax credit, an investment gain — is capped at
+operating profit after tax before scoring (tagged `one-off`).
 
 ## Setup
 
