@@ -55,9 +55,9 @@ so.
 | | source |
 |---|---|
 | roster, board, category, trading currency | HKEX's own *List of Securities* — every Main Board and GEM line |
-| pre-gate market caps | HKEX's equities feed, one request for the whole market |
+| pre-gate and liquidity | one batched Yahoo price download over every line, 60-session median traded value; lines under the floor never reach `.info` |
+| fallback market caps | HKEX's equities feed (dead since ~2026-10-15; kept in case it returns) |
 | multiples, EPS, book, yield, industry | Yahoo `.info` on the HK line, `fast_info` when the market cap is blank |
-| liquidity | one batched Yahoo price download, 60-session median traded value |
 | filed statements | Yahoo annual income statement and balance sheet |
 
 ## Hong Kong traps this handles

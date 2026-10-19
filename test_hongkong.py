@@ -601,8 +601,147 @@ def check_cashflow_oneoff() -> list[str]:
     chk(not bool(j.loc["BANK", "oneoff_capped"]), "financials exempt")
     return fails
 
+# ---------------------------------------------------------------------------
+# The turnover pre-gate and the rate guard (HKEX's feed died 2026-10-15)
+# ---------------------------------------------------------------------------
+def check_pregate_and_guard():
+    print("\n=== turnover pre-gate and rate guard ===")
+    import tempfile
+    import time
+    import yfinance
+    import providers_hk as P
+
+    cfg = ScreenConfig()
+    floor_hkd = cfg.min_adv_usd / USD_PER_HKD
+    df = pd.DataFrame([
+        dict(ticker="0700.HK", is_h_share=False, adv_local=5e9),
+        dict(ticker="0001.HK", is_h_share=False, adv_local=floor_hkd),
+        dict(ticker="8001.HK", is_h_share=False, adv_local=floor_hkd * 0.2),
+        # An H-share bank that does not trade: its turnover is the Hong Kong
+        # line's own, so - unlike the market-cap pre-gate - no exemption.
+        dict(ticker="1963.HK", is_h_share=True, adv_local=1e5),
+        dict(ticker="2999.HK", is_h_share=False, adv_local=np.nan),
+    ])
+    out, st = HF.adv_pregate(df, USD_PER_HKD, cfg)
+    sent = set(out["ticker"])
+    ok({"0700.HK", "0001.HK"} <= sent and "8001.HK" not in sent,
+       "turnover pre-gate: under the USD floor not sent, at the floor sent")
+    ok("1963.HK" not in sent, "an H-share under the floor is not exempt (its own line's turnover)")
+    ok("2999.HK" in sent and st["pregate_adv_unmeasured"] == 1,
+       "a line the download did not answer for is sent, never guessed illiquid")
+    ok(st["pregate_adv_dropped"] == 2 and st["pregate_sent_to_yahoo"] == 3, "pre-gate counts")
+    off, _ = HF.adv_pregate(df, USD_PER_HKD, ScreenConfig(adv_pregate=False))
+    sk, _ = HF.adv_pregate(df, USD_PER_HKD, ScreenConfig(min_adv_usd=0.0))
+    ok(len(off) == len(df) and len(sk) == len(df),
+       "--no-pregate and --skip-liquidity send every line")
+
+    # The refusal test. 100 liquid lines, Yahoo prices 60 - the shape of the
+    # thinned runs from 2026-10-15 - plus 30 unmeasured lines left unpriced.
+    liquid = pd.DataFrame({"adv_local": [1e8] * 100,
+                           "market_cap_local": [1e10] * 60 + [np.nan] * 40})
+    dead = pd.DataFrame({"adv_local": [np.nan] * 30, "market_cap_local": [np.nan] * 30})
+    n, b, share, need = HF.priced_share(pd.concat([liquid, dead]), cfg)
+    ok(b == 100 and share == 0.6 and share < need,
+       "60% of liquid lines priced is refused (the old 50%-of-all rule published it)")
+    liquid.loc[:95, "market_cap_local"] = 1e10
+    n, b, share, need = HF.priced_share(pd.concat([liquid, dead]), cfg)
+    ok(share >= need, "96% priced passes; unmeasured, unpriced lines do not count against it")
+    n, b, share, need = HF.priced_share(pd.concat([liquid, dead]), ScreenConfig(adv_pregate=False))
+    ok(b == 130 and need == 0.5, "pre-gate off: the old 50%-of-everything rule")
+
+    # RateGuard: a run of failures pauses, a second run stops the pool.
+    g = P.RateGuard("test", limit=3, cooldown=0.05, max_cooldowns=1)
+    for _ in range(3):
+        g.hit()
+    paused = g.resume_at > time.time()
+    t0 = time.time()
+    ok(paused and g.gate() and time.time() - t0 >= 0.03 and not g.tripped,
+       "rate guard: three failures in a row pause every worker, then resume")
+    g.hit(); g.hit(); g.ok(); g.hit(); g.hit()
+    ok(not g.tripped, "a success in between resets the count")
+    g.hit()
+    ok(g.tripped and not g.gate(), "failures after the last cooldown stop the pool")
+
+    # snapshot(): a .info with no price and no cap is a FAILURE, so silent
+    # throttling trips the guard instead of thinning the market.
+    calls = []
+
+    class FakeTicker:
+        def __init__(self, t):
+            self.t = t
+
+        @property
+        def info(self):
+            calls.append(self.t)
+            if self.t.startswith("GOOD"):
+                return {"marketCap": 1e10, "regularMarketPrice": 10.0, "currency": "HKD"}
+            return {"quoteType": "EQUITY"}          # Yahoo's throttled shape
+
+    real = yfinance.Ticker
+    yfinance.Ticker = FakeTicker
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            c = ScreenConfig(cache_dir=d, request_delay=0.0, max_workers=1,
+                             guard_limit=4, guard_cooldown_s=0.01, guard_max_cooldowns=1,
+                             snapshot_second_pass_pause_s=0.0)
+            tickers = ["GOOD1", "GOOD2"] + [f"EMPTY{i}" for i in range(30)]
+            snap = P.HKEXProvider(c).snapshot(tickers, "2026-10-19")
+    finally:
+        yfinance.Ticker = real
+    priced = set(snap.loc[snap["market_cap_local"].notna(), "ticker"])
+    ok(priced == {"GOOD1", "GOOD2"}, "snapshot: priced lines kept, empty answers unpriced")
+    ok(len(calls) <= 2 + 1 + 2 * 4 + 2, f"empty .info answers trip the guard (and no "
+       f"second pass after a trip): {len(calls)} calls for 30 empty lines, not 60")
+
+    # A shedding stretch shorter than the guard's limit: FLAKY lines answer
+    # empty twice (both attempts), then normally - the second pass gets them.
+    seen: dict = {}
+
+    class FlakyTicker:
+        def __init__(self, t):
+            self.t = t
+
+        @property
+        def info(self):
+            seen[self.t] = seen.get(self.t, 0) + 1
+            if self.t.startswith("FLAKY") and seen[self.t] <= 2:
+                return {}
+            return {"marketCap": 1e10, "regularMarketPrice": 10.0, "currency": "HKD"}
+
+    yfinance.Ticker = FlakyTicker
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            c = ScreenConfig(cache_dir=d, request_delay=0.0, max_workers=1,
+                             snapshot_second_pass_pause_s=0.0)
+            tickers = ["GOOD1", "FLAKY1", "GOOD2", "FLAKY2", "GOOD3"]
+            snap = P.HKEXProvider(c).snapshot(tickers, "2026-10-19")
+    finally:
+        yfinance.Ticker = real
+    ok(snap["market_cap_local"].notna().all() and seen["FLAKY1"] == 3,
+       "snapshot: lines lost to a short shedding stretch are recovered by a second pass")
+
+    # liquidity(): a line the batched download left out is asked again once.
+    idx = pd.date_range("2026-07-01", periods=70, freq="B")
+
+    def panel(tks):
+        cols = pd.MultiIndex.from_product([["Close", "Volume"], tks])
+        return pd.DataFrame(np.ones((len(idx), 2 * len(tks))) * 100.0, index=idx, columns=cols)
+    asked = []
+
+    def fake_panel(tks, days, chunk=80):
+        asked.append(list(tks))
+        return panel([t for t in tks if len(asked) > 1 or t != "0005.HK"])
+    prov = P.HKEXProvider(cfg)
+    prov.price_panel = fake_panel
+    adv = prov.liquidity(["0700.HK", "0005.HK"], 60, retry_pause=0.0)
+    ok(set(adv["ticker"]) == {"0700.HK", "0005.HK"} and asked[1] == ["0005.HK"]
+       and abs(adv.set_index("ticker").loc["0005.HK", "adv_local"] - 1e4) < 1e-6,
+       "turnover: a line the download missed is asked again, alone, and measured")
+
+
 def main() -> int:
     check_parsers()
+    check_pregate_and_guard()
     FAILURES.extend(check_cashflow_oneoff())
     check_roster()
     check_screens()

@@ -8,21 +8,25 @@
                download. It carries no industry - see config_hk.
 
   market caps  HKEX's equities feed, the data behind its own stock screener:
-               one request returns a market cap for all ~2,800 lines. It is
-               the pre-gate (invariant 7, as Korea and Japan read it), and the
-               market-cap fallback when Yahoo has a price and no cap. FOR AN
-               H-SHARE IT IS THE H TRANCHE ONLY - PetroChina HK$217bn against
-               Yahoo's HK$1.88tn for the whole company - so H-shares bypass
-               the pre-gate and never take it as a fallback.
+               one request returned a market cap for all ~2,800 lines until
+               about 2026-10-15; since then it returns 26 rows (RMB counters
+               and warrants) for every query. Kept as a market-cap pre-gate
+               and fallback in case it comes back; a thin answer is logged.
+               FOR AN H-SHARE IT IS THE H TRANCHE ONLY - PetroChina HK$217bn
+               against Yahoo's HK$1.88tn for the whole company - so H-shares
+               bypass that pre-gate and never take it as a fallback.
+
+  liquidity    batched yf.download over EVERY roster line, before .info:
+               median daily traded value over the lookback. It is the
+               pre-gate that does not depend on HKEX (a line under the
+               liquidity floor cannot pass the later gate, which reads the
+               same numbers), and the liquidity gate itself. HKEX is the
+               only venue for these lines, so unlike Xetra or Euronext this
+               is the whole market's volume, not a lower bound.
 
   fundamentals yfinance .info on the Hong Kong line (0700.HK), one call per
                pre-gate survivor, fast_info as the market-cap fallback -
-               France's snapshot(), fields unchanged.
-
-  liquidity    one batched yf.download for the size survivors: median daily
-               traded value over the lookback. HKEX is the only venue for
-               these lines, so unlike Xetra or Euronext this is the whole
-               market's volume, not a lower bound.
+               France's snapshot(), fields unchanged, under RateGuard.
 
   statements   Yahoo annual income statement + balance sheet + seven years of
                daily closes. build_statement_record is the UK build's,
@@ -50,6 +54,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 
 import numpy as np
@@ -71,6 +76,8 @@ EQUITIES_PAGE = "https://www.hkex.com.hk/Market-Data/Securities-Prices/Equities?
 FILTER_URL = ("https://www1.hkex.com.hk/hkexwidget/data/getequityfilter?lang=eng"
               "&token={token}&sort=5&order=0&all=1&qid={qid}&callback=cb")
 YAHOO_SUFFIX = ".HK"
+# A healthy feed carries ~2,800 HKD caps; from 2026-10-15 it carried none.
+MIN_FEED_CAPS = 2000
 # HKD is pegged to USD inside 7.75-7.85. Outside a slightly wider band a live
 # rate is wrong, not news.
 USD_PER_HKD_BAND = (1 / 7.95, 1 / 7.65)
@@ -91,6 +98,73 @@ SNAPSHOT_FIELDS = (
     # flag, config_hk.CONTROL_MIN_INSIDERS.
     "insiders_pct",
 )
+
+
+def is_rate_limit(e: Exception) -> bool:
+    return "RateLimit" in type(e).__name__ or "Too Many Requests" in str(e)
+
+
+class RateGuard:
+    """Pauses, then stops, a worker pool after a run of failed requests.
+
+    The US build's. Yahoo's block is per IP and lasts minutes, so every
+    request after it fails - and each one deepens it. After `limit`
+    failures with no success in between, every worker pauses for `cooldown`
+    seconds and the pool resumes - up to `max_cooldowns` times, then it
+    stops asking; the cache keeps what arrived, the run refuses to screen a
+    partial universe, and a re-run fills the gap.
+
+    A failure is a rate-limit error, a .info with no price and no market
+    cap, or an empty income statement. Hong Kong learned the middle one the
+    hard way: from 2026-10-15, with HKEX's feed dead and the pre-gate off,
+    Yahoo answered a third to a half of ~2,700 .info calls with empty dicts
+    and no error, and the run published the 52-64% it got.
+    """
+
+    def __init__(self, what: str, limit: int = 25, cooldown: float = 120.0,
+                 max_cooldowns: int = 3):
+        self.what, self.limit = what, limit
+        self.cooldown, self.max_cooldowns = cooldown, max_cooldowns
+        self.n, self.used, self.tripped = 0, 0, False
+        self.resume_at = 0.0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_cfg(cls, what: str, cfg: ScreenConfig) -> "RateGuard":
+        return cls(what, cfg.guard_limit, cfg.guard_cooldown_s, cfg.guard_max_cooldowns)
+
+    def gate(self) -> bool:
+        """Called before each request: waits out a cooldown, False once tripped."""
+        while True:
+            with self._lock:
+                if self.tripped:
+                    return False
+                wait = self.resume_at - time.time()
+            if wait <= 0:
+                return True
+            time.sleep(min(wait, 5.0))
+
+    def ok(self) -> None:
+        with self._lock:
+            self.n = 0
+
+    def hit(self) -> None:
+        with self._lock:
+            self.n += 1
+            if self.n < self.limit or self.tripped or time.time() < self.resume_at:
+                return
+            if self.used < self.max_cooldowns:
+                self.used += 1
+                self.n = 0
+                self.resume_at = time.time() + self.cooldown
+                log.warning("Yahoo: %d %s requests failed in a row - pausing %.0fs "
+                            "(cooldown %d of %d)", self.limit, self.what, self.cooldown,
+                            self.used, self.max_cooldowns)
+            else:
+                self.tripped = True
+                log.error("Yahoo is rate-limiting this IP: %s requests still failing "
+                          "after %d cooldowns. Stopping - the cache keeps what arrived; "
+                          "re-run in a few minutes to fill the rest.", self.what, self.used)
 
 
 def out_schema(df: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
@@ -253,7 +327,12 @@ class HKEXProvider:
                            headers={"Referer": "https://www.hkex.com.hk/"}, timeout=60)
             r.raise_for_status()
             out = parse_equity_filter(r.text)
-            log.info("  HKEX market caps for %d lines", int(out["hkex_mcap_hkd"].notna().sum()))
+            n = int(out["hkex_mcap_hkd"].notna().sum())
+            log.info("  HKEX market caps for %d lines", n)
+            if n < MIN_FEED_CAPS:
+                log.warning("HKEX's equities feed answered only %d HKD market caps (it "
+                            "carried ~2,800 until 2026-10-15) - no market-cap pre-gate or "
+                            "fallback; the turnover pre-gate still applies", n)
             return out
         except Exception as e:                            # noqa: BLE001
             log.warning("HKEX equities feed failed (%s) - no pre-gate, every line "
@@ -310,23 +389,34 @@ class HKEXProvider:
                 return out_schema(cached, tickers)
             log.debug("probe ticker %s failed non-fatally: %s", todo[0], e)
 
+        guard = RateGuard.from_cfg("snapshot", self.cfg)
+
         def one(t: str) -> dict:
             rec = {"ticker": t}
             i = {}
             if self.cfg.request_delay:
                 time.sleep(self.cfg.request_delay)
             for attempt in (0, 1):
+                if not guard.gate():
+                    return rec
                 try:
                     i = yf.Ticker(t).info or {}
                     if i.get("marketCap") is not None or i.get("regularMarketPrice"):
+                        guard.ok()
                         break
+                    # No price and no cap, no error: Yahoo shedding load (or
+                    # a dead line). Counted, so a run of them is a cooldown,
+                    # not a quietly thinner market; the retry waits it out.
+                    guard.hit()
                 except Exception as e:                    # noqa: BLE001
                     log.debug("%s attempt %d: %s", t, attempt, e)
-                    if "RateLimit" in type(e).__name__:
-                        return rec
+                    if is_rate_limit(e):
+                        guard.hit()
+                        continue
                 if attempt == 0:
                     time.sleep(0.5 + self.cfg.request_delay)
-            if not i:
+            if not (i.get("marketCap") is not None or i.get("regularMarketPrice")
+                    or i.get("currentPrice")):
                 return rec
             price = i.get("regularMarketPrice") or i.get("currentPrice")
             mcap, src = i.get("marketCap"), "info"
@@ -369,12 +459,45 @@ class HKEXProvider:
 
         log.info("  fetching %d tickers (%d already cached)", len(todo), len(have))
         rows: list[dict] = []
-        with cf.ThreadPoolExecutor(max_workers=self.cfg.max_workers) as ex:
-            for n, rec in enumerate(ex.map(one, todo), 1):
-                rows.append(rec)
-                if n % 50 == 0:
-                    log.info("  fetched %d/%d", n, len(todo))
 
+        def run_pool(batch: list[str]) -> None:
+            with cf.ThreadPoolExecutor(max_workers=self.cfg.max_workers) as ex:
+                for n, rec in enumerate(ex.map(one, batch), 1):
+                    rows.append(rec)
+                    if n % 50 == 0:
+                        log.info("  fetched %d/%d", n, len(batch))
+                    # Save as we go: a run killed half-way keeps what it fetched.
+                    if n % 400 == 0:
+                        self._save_snapshot(cached, rows, asof)
+
+        run_pool(todo)
+        # Second pass: the ~dozen lines per shedding stretch that failed both
+        # attempts before the guard paused. Not after a trip - Yahoo is
+        # still refusing, and the run will refuse to screen anyway.
+        priced = {r["ticker"] for r in rows if r.get("market_cap_local") is not None}
+        again = [t for t in todo if t not in priced]
+        if again and not guard.tripped and len(again) < len(todo):
+            log.info("  second pass: %d unpriced lines, asking again in %.0fs",
+                     len(again), self.cfg.snapshot_second_pass_pause_s)
+            time.sleep(self.cfg.snapshot_second_pass_pause_s)
+            first_used = guard.used
+            guard = RateGuard.from_cfg("snapshot (second pass)", self.cfg)
+            run_pool(again)
+            guard.used += first_used
+            log.info("  second pass priced %d of %d",
+                     sum(1 for r in rows[-len(again):] if r.get("market_cap_local") is not None),
+                     len(again))
+
+        out = self._save_snapshot(cached, rows, asof)
+        out = out[out["ticker"].isin(tickers)].reset_index(drop=True)
+        got = int(out["market_cap_local"].notna().sum())
+        fb = int((out["mcap_source"] == "fast_info").sum())
+        log.info("  %d/%d tickers have a market cap (%d via fast_info)%s",
+                 got, len(tickers), fb,
+                 f"; {guard.used} cooldown(s)" if guard.used else "")
+        return out
+
+    def _save_snapshot(self, cached: pd.DataFrame, rows: list[dict], asof: str) -> pd.DataFrame:
         fresh = pd.DataFrame(rows)
         parts = [d for d in (cached, fresh) if not d.empty]
         out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
@@ -382,18 +505,11 @@ class HKEXProvider:
         # Priced rows first so a cached hit beats a fresh throttled blank.
         out = out.sort_values("market_cap_local", na_position="last")
         out = out.drop_duplicates(subset=["ticker"], keep="first")
-
         try:
             os.makedirs(self.cfg.cache_dir, exist_ok=True)
             out.to_csv(self._cache_path(asof), index=False, encoding="utf-8")
         except Exception as e:                            # noqa: BLE001
             log.warning("  could not write cache: %s", e)
-
-        out = out[out["ticker"].isin(tickers)].reset_index(drop=True)
-        got = int(out["market_cap_local"].notna().sum())
-        fb = int((out["mcap_source"] == "fast_info").sum())
-        log.info("  %d/%d tickers have a market cap (%d via fast_info)",
-                 got, len(tickers), fb)
         return out
 
     def quarterly_equity(self, tickers: list[str]) -> dict[str, float]:
@@ -450,6 +566,32 @@ class HKEXProvider:
         if not frames:
             return pd.DataFrame()
         return pd.concat(frames, axis=1)
+
+    def liquidity(self, tickers: list[str], days: int, retry_pause: float = 20.0) -> pd.DataFrame:
+        """average_daily_value over a fresh panel, with one second pass for
+        the lines the first left out.
+
+        yf.download fails per ticker without raising - a throttled chunk
+        comes back as empty columns - so a missing line is asked again once,
+        after a pause, before it is reported missing. What is still missing
+        is left to the caller (the pre-gate sends it on to .info rather than
+        guess it illiquid).
+        """
+        tickers = list(dict.fromkeys(tickers))
+        adv = self.average_daily_value(self.price_panel(tickers, days), tickers, days)
+        miss = [t for t in tickers if t not in set(adv["ticker"])]
+        if miss:
+            log.info("  turnover: %d of %d lines missing - asking again in %.0fs",
+                     len(miss), len(tickers), retry_pause)
+            time.sleep(retry_pause)
+            more = self.average_daily_value(self.price_panel(miss, days), miss, days)
+            adv = pd.concat([adv, more], ignore_index=True)
+        n = adv["ticker"].nunique() if not adv.empty else 0
+        log.info("  turnover for %d of %d lines", n, len(tickers))
+        if n < 0.5 * len(tickers):
+            log.warning("Yahoo's price download answered for only %d of %d lines - "
+                        "throttled? The rest go on to .info unjudged.", n, len(tickers))
+        return adv.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
 
     @staticmethod
     def average_daily_value(panel: pd.DataFrame, tickers: list[str],
@@ -1024,19 +1166,35 @@ def fetch_statements(snap: pd.DataFrame, cfg: ScreenConfig,
     todo = [t for t in tickers if t not in cached]
     rows = {t: r for t, r in snap.set_index("ticker").iterrows()}
 
+    guard = RateGuard.from_cfg("statement", cfg)
+
     def one(t: str):
         if cfg.request_delay:
             time.sleep(cfg.request_delay)
         r = rows[t]
-        try:
-            tk = yf.Ticker(t)
-            inc, bs = tk.income_stmt, tk.balance_sheet
-            cf = tk.cashflow
-            qinc = tk.quarterly_income_stmt
-            h = tk.history(period="7y", interval="1d", auto_adjust=False)
-        except Exception as e:
-            log.debug("%s statements: %s", t, e)
-            return t, None
+        inc = cf = qinc = h = None
+        for attempt in (0, 1):
+            if not guard.gate():
+                return t, None
+            try:
+                tk = yf.Ticker(t)
+                inc, bs = tk.income_stmt, tk.balance_sheet
+                cf = tk.cashflow
+                qinc = tk.quarterly_income_stmt
+                h = tk.history(period="7y", interval="1d", auto_adjust=False)
+            except Exception as e:
+                log.debug("%s statements attempt %d: %s", t, attempt, e)
+                inc = None
+                if is_rate_limit(e):
+                    guard.hit()
+                continue
+            if inc is not None and not inc.empty:
+                guard.ok()
+                break
+            # Empty with no error: a company with no filings, or Yahoo
+            # shedding load (the US build's first run: 473 of 2,514).
+            # Counted, so a run of them triggers a cooldown; one retry.
+            guard.hit()
         if inc is None or inc.empty:
             return t, None
         px = pd.Series(dtype=float)

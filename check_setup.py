@@ -4,7 +4,7 @@
 
 Run this before main_hk.py. Nearly every failure in this build is a SILENT
 one - a missing market cap reads as "too small", a broken HKEX feed as "no
-pre-gate" (slow, but quiet), a throttled Yahoo as a market where companies
+market-cap fallback" (quiet), a throttled Yahoo as a market where companies
 vanished, a currency field Yahoo stops filling as a multiple off by 7.8x -
 and a full run is slow enough that finding out afterwards is expensive. Each
 check here names what it protects against.
@@ -54,14 +54,18 @@ def roster():
     return f"{len(r)} lines {by}, as at {p.roster_asof or '?'}"
 
 
-@check("HKEX equities feed (pre-gate)")
+@check("HKEX equities feed (market caps)")
 def feed():
     from config_hk import ScreenConfig
-    from providers_hk import HKEXProvider
+    from providers_hk import MIN_FEED_CAPS, HKEXProvider
     m = HKEXProvider(ScreenConfig()).market_caps()
-    if len(m) < 2000:
-        raise RuntimeError(f"only {len(m)} market caps - token or feed moved; the "
-                           "run will still work, without the pre-gate (~3x slower)")
+    n = int(m["hkex_mcap_hkd"].notna().sum())
+    # Rows are not caps: from 2026-10-15 the feed answered 26 rows, none of
+    # them an HKD line, and the old len() test would have said so only by luck.
+    if n < MIN_FEED_CAPS:
+        raise RuntimeError(f"only {n} HKD market caps ({len(m)} rows) - HKEX's feed is "
+                           "thin or dead; the run still works on the turnover "
+                           "pre-gate, without HKEX's market-cap fallback")
     t = m.set_index("code")["hkex_mcap_hkd"].get("00700")
     if not t or t < 1e12:
         raise RuntimeError(f"Tencent's HKEX market cap {t} - units changed?")

@@ -17,6 +17,7 @@ import re
 import sys
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 import hk_filters as HF
@@ -56,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude-controlled", action="store_true",
                    help="drop companies whose insiders hold a majority")
     p.add_argument("--no-pregate", action="store_true",
-                   help="send every line to Yahoo, not only those HKEX's market cap "
-                        "says could clear the size gate (~3x slower)")
+                   help="send every line to Yahoo, not only those whose HKEX market "
+                        "cap and measured turnover could clear the gates (~3x slower)")
     p.add_argument("--adv-days", type=int, default=D.adv_lookback_days)
     p.add_argument("--skip-liquidity", action="store_true")
     p.add_argument("--min-roe", type=float, default=D.min_roe_pct,
@@ -141,6 +142,7 @@ def main() -> int:
         exclude_controlled=a.exclude_controlled,
         adv_lookback_days=a.adv_days,
         pregate_fraction=0.0 if a.no_pregate else D.pregate_fraction,
+        adv_pregate=not (a.no_pregate or a.skip_liquidity),
     )
 
     prov = HKEXProvider(cfg)
@@ -169,13 +171,26 @@ def main() -> int:
     usd_per_hkd = a.fx if a.fx else prov.hkd_to_usd()
     log.info("FX: 1 HKD = %.5f USD (%.4f HKD per USD)", usd_per_hkd, 1 / usd_per_hkd)
 
-    # 3. the pre-gate on HKEX's own market caps (invariant 7: the slow
-    #    per-ticker work only sees lines that could clear the size gate).
+    # 3. the pre-gates (invariant 7: the slow per-ticker work only sees
+    #    lines that could clear the gates). First HKEX's own market caps -
+    #    a no-op while its feed is dead - then measured turnover, from one
+    #    batched price download over every remaining line: a line under the
+    #    liquidity floor can never pass the gate that reads the same panel.
     df = df.merge(prov.market_caps(), on="code", how="left")
     df, pstats = HF.pregate(df, usd_per_hkd, cfg)
     ustats.update(pstats)
-    log.info("pre-gate: %d lines go to Yahoo (%d H-shares)", len(df),
-             pstats["pregate_h_shares"])
+    log.info("market-cap pre-gate: %d lines left (%d H-shares, %d with no HKEX cap)",
+             len(df), pstats["pregate_h_shares"], pstats["pregate_no_hkex_cap"])
+    if cfg.adv_pregate:
+        log.info("fetching %d days of prices for %d lines (turnover pre-gate)...",
+                 cfg.adv_lookback_days, len(df))
+        df = df.merge(prov.liquidity(df["ticker"].tolist(), cfg.adv_lookback_days),
+                      on="ticker", how="left")
+    df, astats = HF.adv_pregate(df, usd_per_hkd, cfg)
+    ustats.update(astats)
+    log.info("turnover pre-gate: %d lines go to Yahoo (%d under USD %.1fm/day not "
+             "sent, %d unmeasured sent)", len(df), astats["pregate_adv_dropped"],
+             cfg.min_adv_usd / 1e6, astats["pregate_adv_unmeasured"])
 
     # 4. fundamentals: one yfinance .info per line
     log.info("fetching fundamentals for %d tickers...", len(df))
@@ -183,12 +198,16 @@ def main() -> int:
     df = df.merge(snap, on="ticker", how="left")
     n_priced = int(df["market_cap_local"].notna().sum())
     log.info("  %d of %d lines priced by Yahoo", n_priced, len(df))
-    # Refuse rather than screen half the market. Suspended lines are the
-    # healthy misses.
-    if n_priced < 0.5 * len(df):
-        log.error("only %d of %d lines priced. Yahoo is rate-limiting; the cache "
-                  "has kept what arrived, so re-running in a few minutes will fill "
-                  "the rest. Refusing to screen a partial universe.", n_priced, len(df))
+    # Refuse rather than screen a thinned market. With the turnover
+    # pre-gate on, every measured line trades, so the bar is high
+    # (hk_filters.priced_share); suspended lines are the healthy misses.
+    got, base_n, share, need = HF.priced_share(df, cfg)
+    ustats.update({"priced_of_base": got, "priced_base": base_n})
+    if share < need:
+        log.error("only %d of %d lines priced (%.0f%%, need %.0f%%). Yahoo is "
+                  "rate-limiting; the cache has kept what arrived, so re-running in a "
+                  "few minutes will fill the rest. Refusing to screen a partial "
+                  "universe.", got, base_n, 100 * share, 100 * need)
         return 2
     df, mstats = HF.repair_market_caps(df)
     ustats.update({"priced": n_priced,
@@ -212,12 +231,19 @@ def main() -> int:
         print("Nothing cleared the size gate.")
         return 0
 
-    # 7. liquidity: one batched price download, fetched even with
-    #    --skip-liquidity so the measured value reaches the page.
-    log.info("fetching %d days of prices for %d names...", cfg.adv_lookback_days, len(pre))
-    panel = prov.price_panel(pre["ticker"].tolist(), cfg.adv_lookback_days)
-    adv = prov.average_daily_value(panel, pre["ticker"].tolist(), cfg.adv_lookback_days)
-    pre = pre.merge(adv, on="ticker", how="left")
+    # 7. liquidity: the pre-gate's panel, downloaded again only for lines it
+    #    has no number for (all of them with --skip-liquidity or
+    #    --no-pregate), so the measured value reaches the page either way.
+    for c in ("adv_local", "adv_sessions"):
+        if c not in pre.columns:
+            pre[c] = np.nan
+    need = pre.loc[pre["adv_local"].isna(), "ticker"].tolist()
+    if need:
+        log.info("fetching %d days of prices for %d names...", cfg.adv_lookback_days, len(need))
+        adv = prov.liquidity(need, cfg.adv_lookback_days).set_index("ticker")
+        for c in ("adv_local", "adv_sessions"):
+            if c in adv.columns:
+                pre[c] = pre[c].fillna(pre["ticker"].map(adv[c]))
     pre["adv_usd"] = pd.to_numeric(pre["adv_local"], errors="coerce") * usd_per_hkd
 
     # 7b. one line per issuer (Swire A / B) - before the gate, so the traded

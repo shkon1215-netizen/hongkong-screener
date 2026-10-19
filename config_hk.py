@@ -176,6 +176,18 @@ class ScreenConfig:
     # HKEX's figure and Yahoo's differ by a day's price and a share count, and
     # the gate proper is still Yahoo's. H-shares bypass it.
     pregate_fraction: float = 0.25
+    # The liquidity pre-gate (hk_filters.adv_pregate): the batched price
+    # download runs over every roster line BEFORE .info, and a line under
+    # min_adv_usd is not sent - it could never pass the liquidity gate,
+    # which reads the same panel. It does not depend on HKEX's feed, which
+    # went dead around 2026-10-15 (26 rows for every query). Off with
+    # --no-pregate and --skip-liquidity.
+    adv_pregate: bool = True
+    # Share of the liquid lines (those the ADV pre-gate passed on measured
+    # turnover) that Yahoo must price, or the run refuses to screen. Every
+    # one of them traded at least min_adv_usd a day over the lookback, so a
+    # miss is throttling, not a dead line. 0.5 when the ADV pre-gate is off.
+    min_priced_share: float = 0.9
 
     # --- Valuation test ---
     discount_threshold: float = 0.20
@@ -236,6 +248,20 @@ class ScreenConfig:
     # UK build's measured setting.
     max_workers: int = 2
     request_delay: float = 0.25
+    # providers_hk.RateGuard: this many failed requests in a row (a
+    # rate-limit error, a .info with no price and no market cap, an empty
+    # income statement) pause every worker for the cooldown, up to the
+    # number of cooldowns; then the pool stops and the run refuses to screen.
+    guard_limit: int = 25
+    guard_cooldown_s: float = 120.0
+    guard_max_cooldowns: int = 3
+    # Lines still unpriced after the pool (lost to a shedding stretch before
+    # the guard paused) are asked once more, after this pause, by a fresh
+    # pool - so a run recovers them itself instead of needing a re-run.
+    # Measured 2026-10-19: the first 25 .info answers came back empty on two
+    # cold runs, one of them after a 60s rest following the price download,
+    # so the download is not the cause and no rest is taken after it.
+    snapshot_second_pass_pause_s: float = 60.0
     cache_dir: str = ".hk_cache"
     cache_ttl_hours: int = 20
 

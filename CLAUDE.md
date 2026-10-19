@@ -11,7 +11,7 @@ Main Board + GEM (2,836 equity and REIT lines on 2026-10-14).
 ```bash
 python test_hongkong.py   # offline, must pass
 python check_setup.py     # nine live checks
-python main_hk.py -v      # full run, ~10 min cold (.info x1,300, statements x570), ~2 min warm
+python main_hk.py -v      # full run, ~17 min cold (prices x2,744, .info x660, statements x570), ~2 min warm
 python serve.py           # dashboard with working Refresh (dashboard.cmd)
 python sync_dashboard_from_korea.py ../Korea/dashboard.py   # dashboard.py is generated
 ```
@@ -63,11 +63,28 @@ python main_hk.py --no-pregate           # send all 2,700 lines to Yahoo (~3x sl
    consolidation — BILLION IND 02943 beside 02299. Their market caps sit on
    the wrong share count for weeks (HKEX shows SG Group's two lines 10x
    apart). 17 dropped on 2026-10-14.
-3. **The pre-gate never judges an H-share.** HKEX's market cap for a
-   mainland-incorporated company is the H tranche only — PetroChina HK$217bn
-   on HKEX, HK$1.88tn on Yahoo. Every CNE ISIN (538 lines) goes to Yahoo;
-   other lines go only if HKEX's cap is at least a quarter of the floor.
-   1,300 of 2,750 lines are priced, ~6 minutes cold.
+3. **The pre-gate is measured turnover, not HKEX's market cap.** HKEX's
+   equities feed (`getequityfilter`) died around 2026-10-15: every query,
+   `all=1` included, returns 26 rows (24 RMB counters, 2 warrants) and none
+   is an HKD cap. With no pre-gate, all ~2,700 lines went to `.info`, Yahoo
+   silently priced 52–64% of them, that cleared the 50% refusal bar, and
+   the page published a randomly thinned market (266–342 names past the
+   gates against 566). Now one batched `yf.download` over every roster line
+   runs first (`HKEXProvider.liquidity`, a second pass for lines it missed),
+   and `hk_filters.adv_pregate` sends to `.info` only lines at or above
+   `min_adv_usd` — the liquidity gate reads the same panel, so nothing it
+   would pass is lost. H-shares are not exempt here: the turnover is the
+   Hong Kong line's own. A line the download did not answer for is sent,
+   never guessed illiquid. `--skip-liquidity` and `--no-pregate` turn it
+   off. The old market-cap pre-gate is kept and is a no-op while the feed is
+   dead; if it returns, it never judges an H-share (HKEX's cap is the H
+   tranche only — PetroChina HK$217bn on HKEX, HK$1.88tn on Yahoo).
+   **The refusal bar is 90% of the lines the turnover pre-gate passed on a
+   measurement** (`hk_filters.priced_share`): each traded USD 1m a day, so
+   an unpriced one is throttling. 50% of everything only with the pre-gate
+   off. `RateGuard` (the US build's) counts a `.info` with no price and no
+   cap, and an empty income statement, as a failure: 25 in a row pause
+   every worker for two minutes (three times), then the pool stops.
 4. **Yahoo's market cap on an H-share is all shares, A and H** (ICBC: H price
    × 356bn shares). That is the company's size, it matches the filed share
    count, so the history screen's basis check holds. `check_setup.py`
@@ -191,6 +208,14 @@ Browser verdict at default thresholds equals Python's: 157 / 104 / 75 / 44,
 and every per-test count (P/B < 1 183, EV < 8 185, fair 145, yield 291,
 ROE 332, carve-out 32).
 
+**After the feed died (turnover pre-gate, 2026-10-16 close, local):**
+2,744 lines after roster hygiene, turnover for 2,735, 661 sent to Yahoo
+(2,083 under USD 1m/day), 649 priced, 567 cleared USD 600m, **566 past
+size + liquidity**; 160 passing = 112 / 70 / 43 (P/FCF and shareholder
+yield since the reference). Browser equals Python on every count (P/B < 1
+188, EV < 8 190, fair 141, shareholder yield 296, ROE 330, carve-out 31,
+history 77 / 91 / 62).
+
 
 ## Cash flow, shareholder yield and the one-off guard (added 2026-10-18)
 
@@ -242,11 +267,33 @@ Added to all eight screeners at once, from the US build. Source: yfinance's annu
 
 ## Likely first failures
 
-- **Yahoo throttles silently.** The run refuses to screen under half priced;
-  the per-day cache fills gaps on re-run.
-- **HKEX's equities feed moves its token.** `token_from_page` reads it off
-  the equities page; on failure the run continues without the pre-gate
-  (~3x slower) and says so. `check_setup.py` checks it.
+- **Yahoo throttles silently** — empty `.info` dicts, no error.
+  `RateGuard` turns a run of them into a cooldown and retry; the run refuses
+  to screen under 90% of the liquid lines priced; the per-day cache fills
+  gaps on re-run (CI retries once after a pause). Measured on the first
+  local run with the turnover pre-gate (2026-10-19, Friday's close): the
+  first 25 `.info` answers were empty — a cooldown before one line was
+  priced — and a second stretch hit after 250 lines; 620 of 661 priced,
+  543 past the gates (566 on 2026-10-14). A 60 s rest between the price
+  download and `.info` was tried on the next cold run and changed nothing
+  (the first 25 empty again), so the download is not the trigger and the
+  rest was removed. What fixed it: lines still unpriced after the pool get
+  a second pass from a fresh pool after `snapshot_second_pass_pause_s`
+  (60 s) — the dozen or so per stretch that failed both attempts before
+  the guard paused. Not after a trip. That run: 1 cooldown, second pass
+  12 of 24, 649 of 661 priced, **566 past the gates** — the reference
+  exactly. A cold run therefore always pays one cooldown (~2 min).
+- **HKEX's equities feed is dead** (since ~2026-10-15: 26 rows, no HKD
+  caps). `check_setup.py` FAILS under 2,000 HKD caps; the run logs a warning
+  and carries on with the turnover pre-gate, without HKEX's market-cap
+  fallback (`mcap_via_hkex` 0). If the feed returns, it may move its token:
+  `token_from_page` reads it off the equities page. HKEX has no substitute:
+  the per-stock quote widget refuses the page token, and the Daily
+  Quotations report (`dayquot/dYYMMDDe.htm`, 23 MB) carries turnover, not
+  market caps.
+- **The batched price download is throttled.** It fails per ticker without
+  raising; `liquidity` asks the missing lines again once, and anything
+  still unmeasured goes on to `.info` (slower, never thinner).
 - **HKEX changes the List of Securities layout.** Header found by its
   "Stock Code" cell; `check_setup.py` asserts Tencent, HSBC, ICBC, Alibaba
   and the presence of RMB counters.

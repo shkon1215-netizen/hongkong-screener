@@ -115,6 +115,58 @@ def pregate(df: pd.DataFrame, usd_per_hkd: float,
     return df[keep].copy(), stats
 
 
+def adv_pregate(df: pd.DataFrame, usd_per_hkd: float,
+                cfg: K.ScreenConfig) -> tuple[pd.DataFrame, dict]:
+    """Measured turnover as the first cut, so .info only sees lines that
+    could clear the liquidity gate. Pure.
+
+    `adv_local` is the median daily traded value in HKD from the batched
+    price download, the same number the liquidity gate reads later - so a
+    line under `min_adv_usd` here can never pass there, and dropping it
+    loses nothing. Unlike the market-cap pre-gate, H-shares get no
+    exemption: the turnover is the Hong Kong line's own, the thing the gate
+    measures. A line the download did not answer for is sent, never
+    guessed illiquid; with `adv_pregate` off (--no-pregate,
+    --skip-liquidity) everything is sent.
+    """
+    adv_usd = pd.to_numeric(df.get("adv_local", pd.Series(np.nan, index=df.index)),
+                            errors="coerce") * usd_per_hkd
+    if not cfg.adv_pregate or cfg.min_adv_usd <= 0:
+        keep = pd.Series(True, index=df.index)
+    else:
+        keep = adv_usd.isna() | (adv_usd >= cfg.min_adv_usd)
+    stats = {"pregate_adv_measured": int(adv_usd.notna().sum()),
+             "pregate_adv_dropped": int((~keep).sum()),
+             "pregate_adv_unmeasured": int(adv_usd.isna().sum()),
+             "pregate_sent_to_yahoo": int(keep.sum())}
+    return df[keep].copy(), stats
+
+
+def priced_share(df: pd.DataFrame, cfg: K.ScreenConfig) -> tuple[int, int, float, float]:
+    """(priced, base, share, required) for the run's refusal test. Pure.
+
+    With the turnover pre-gate on, the base is the lines it passed ON A
+    MEASUREMENT: each traded at least the floor a day, so Yahoo knows it,
+    and an unpriced one is throttling. That is the test the old 50%-of-all
+    rule failed: with HKEX's feed dead, 52-64% of 2,700 lines priced and
+    the run published a randomly thinned market. Lines nobody measured
+    (suspended, newly listed) are judged by the old 50% rule only when the
+    pre-gate is off.
+    """
+    mc = pd.to_numeric(df.get("market_cap_local", pd.Series(np.nan, index=df.index)),
+                       errors="coerce").notna()
+    adv = pd.to_numeric(df.get("adv_local", pd.Series(np.nan, index=df.index)),
+                        errors="coerce")
+    if cfg.adv_pregate and cfg.min_adv_usd > 0 and adv.notna().any():
+        base = adv.notna()
+        need = cfg.min_priced_share
+    else:
+        base = pd.Series(True, index=df.index)
+        need = 0.5
+    n, b = int((mc & base).sum()), int(base.sum())
+    return n, b, (n / b if b else 0.0), need
+
+
 def repair_market_caps(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """HKEX's market cap where Yahoo has none - never for an H-share.
 
